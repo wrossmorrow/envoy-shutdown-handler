@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: Slashgear/action-check-pr-title@v4.3.0
         with:
-          regexp: "^(Revert \")?((minor|fix|config|infra|ci|doc|spelling|dependency)?) (.*){256}[\"]?$"
+          regexp: "^(Revert \")?(minor|fix|config|infra|feat|ci|doc|spelling|dependency): (.*){256}[\"]?$"
   pr-labels:
     name: PR labelling
     runs-on: ubuntu-latest
