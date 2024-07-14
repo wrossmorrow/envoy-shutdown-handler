@@ -1,0 +1,26 @@
+services:
+
+  envoy:
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.30-latest}
+    ports:
+      - "8080:8080"
+      - "9901:9901"
+    volumes:
+      - ./${ENVOY_CONFIG:-envoy.yaml}:/etc/envoy/envoy.yaml
+
+  shutdown:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9001:9001"
+    command:
+      - -envoy-admin-host
+      - envoy
+      # - -force
+      # - "true"
+
+  upstream:
+    image: ghcr.io/wrossmorrow/simple-echo-server:main
+    ports:
+      - "8000:8000"

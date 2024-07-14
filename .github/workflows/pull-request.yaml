@@ -1,0 +1,30 @@
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+jobs:
+  pr-title:
+    name: Validate PR Title
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: Slashgear/action-check-pr-title@v4.3.0
+        with:
+          regexp: "^(Revert \")?((minor|fix|config|infra|ci|doc|spelling|dependency)?) (.*){256}[\"]?$"
+  pr-labels:
+    name: PR labelling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v4
+        with: 
+          dot: true
+  build:
+    uses: ./.github/workflows/build.yaml
+    with:
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

@@ -1,0 +1,7 @@
+source:
+  - "**/*.go"
+deployment:
+  - .github/workflows/**
+  - Dockerfile
+  - .dockerignore
+
