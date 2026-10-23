@@ -6,18 +6,38 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
 // newEnvoyMock spins up an httptest server emulating the small subset of the
 // envoy admin interface used by this handler and points the package-level
-// adminBaseUrl at it.
+// adminBaseUrl at it. It restores the previous adminBaseUrl when the test
+// finishes so the global does not leak into other tests.
 func newEnvoyMock(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
+	origAdminBaseUrl := adminBaseUrl
 	adminBaseUrl = srv.URL
+	t.Cleanup(func() { adminBaseUrl = origAdminBaseUrl })
 	return srv
+}
+
+// setAdminBaseUrl points the handler at the given URL and restores the
+// previous value when the test finishes. Used for pointing the handler at an
+// unreachable endpoint.
+func setAdminBaseUrl(t *testing.T, url string) {
+	t.Helper()
+	origAdminBaseUrl := adminBaseUrl
+	adminBaseUrl = url
+	t.Cleanup(func() { adminBaseUrl = origAdminBaseUrl })
+}
+
+// resetForce resets the package-level force flag after a test that flipped it.
+func resetForce(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() { *force = false })
 }
 
 // statsHandler responds to envoy stats queries with the given active
@@ -107,7 +127,7 @@ func TestFailEnvoyHealthCheck(t *testing.T) {
 	})
 
 	t.Run("envoy unreachable", func(t *testing.T) {
-		adminBaseUrl = "http://127.0.0.1:1" // nothing listening here
+		setAdminBaseUrl(t, "http://127.0.0.1:1") // nothing listening here
 		if err := failEnvoyHealthCheck(); err == nil {
 			t.Error("failEnvoyHealthCheck() error = nil, want error")
 		}
@@ -121,8 +141,11 @@ func TestStartGracefulDraining(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			if r.URL.Query().Get("graceful") != "true" && r.URL.Query().Get("graceful") != "" {
-				// graceful is a bare flag; just accept any value
+			if _, ok := r.URL.Query()["graceful"]; !ok {
+				// the graceful drain parameter must be present; a bare
+				// ?graceful flag counts as present
+				w.WriteHeader(http.StatusBadRequest)
+				return
 			}
 			w.WriteHeader(http.StatusOK)
 		})
@@ -143,7 +166,7 @@ func TestStartGracefulDraining(t *testing.T) {
 	})
 
 	t.Run("envoy unreachable", func(t *testing.T) {
-		adminBaseUrl = "http://127.0.0.1:1"
+		setAdminBaseUrl(t, "http://127.0.0.1:1")
 		if err := startGracefulDraining(); err == nil {
 			t.Error("startGracefulDraining() error = nil, want error")
 		}
@@ -176,7 +199,7 @@ func TestForceEnvoyShutdown(t *testing.T) {
 	})
 
 	t.Run("envoy unreachable", func(t *testing.T) {
-		adminBaseUrl = "http://127.0.0.1:1"
+		setAdminBaseUrl(t, "http://127.0.0.1:1")
 		if err := forceEnvoyShutdown(); err == nil {
 			t.Error("forceEnvoyShutdown() error = nil, want error")
 		}
@@ -342,8 +365,7 @@ func TestCheckStatsHandler(t *testing.T) {
 	})
 
 	t.Run("envoy unreachable", func(t *testing.T) {
-		adminBaseUrl = "http://127.0.0.1:1"
-		defer func() { adminBaseUrl = "" }()
+		setAdminBaseUrl(t, "http://127.0.0.1:1")
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/check/stats", nil)
@@ -423,8 +445,7 @@ func TestShutdownHandler(t *testing.T) {
 	})
 
 	t.Run("no active connections shuts down immediately", func(t *testing.T) {
-		drainCalled := false
-		forceCalled := false
+		var drainCalled, forceCalled atomic.Bool
 		newEnvoyMock(t, func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.Method == http.MethodPost && r.URL.Path == "/healthcheck/fail":
@@ -433,16 +454,19 @@ func TestShutdownHandler(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				fmt.Fprintf(w, "http.envoy.downstream_cx_active: %d", 0)
 			case r.Method == http.MethodPost && r.URL.Path == "/drain_listeners":
-				drainCalled = true
+				drainCalled.Store(true)
 				w.WriteHeader(http.StatusOK)
 			case r.Method == http.MethodPost && r.URL.Path == "/quitquitquit":
-				forceCalled = true
+				forceCalled.Store(true)
 				w.WriteHeader(http.StatusOK)
 			default:
 				w.WriteHeader(http.StatusNotFound)
 			}
 		})
 
+		// With zero active connections there is nothing to drain, so shutdown
+		// can proceed immediately without the graceful drain or force paths.
+		resetForce(t)
 		*force = true
 		complete = make(chan bool, 1)
 		rec := httptest.NewRecorder()
@@ -452,10 +476,10 @@ func TestShutdownHandler(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("shutdown() status = %d, want %d", rec.Code, http.StatusOK)
 		}
-		if drainCalled {
+		if drainCalled.Load() {
 			t.Error("shutdown() called drain_listeners, want no drain with zero active connections")
 		}
-		if forceCalled {
+		if forceCalled.Load() {
 			t.Error("shutdown() called force shutdown, want no force with zero active connections")
 		}
 		if got := <-complete; !got {
@@ -464,16 +488,14 @@ func TestShutdownHandler(t *testing.T) {
 	})
 
 	t.Run("drains until connections close then force shuts down", func(t *testing.T) {
-		statsCalls := 0
-		drainCalled := false
-		forceCalled := false
+		var statsCalls atomic.Int32
+		var drainCalled, forceCalled atomic.Bool
 		newEnvoyMock(t, func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.Method == http.MethodPost && r.URL.Path == "/healthcheck/fail":
 				w.WriteHeader(http.StatusOK)
 			case r.Method == http.MethodGet && r.URL.Path == "/stats":
-				statsCalls++
-				if statsCalls == 1 {
+				if statsCalls.Add(1) == 1 {
 					w.WriteHeader(http.StatusOK)
 					fmt.Fprintf(w, "http.envoy.downstream_cx_active: %d", 1)
 				} else {
@@ -481,29 +503,30 @@ func TestShutdownHandler(t *testing.T) {
 					fmt.Fprintf(w, "http.envoy.downstream_cx_active: %d", 0)
 				}
 			case r.Method == http.MethodPost && r.URL.Path == "/drain_listeners":
-				drainCalled = true
+				drainCalled.Store(true)
 				w.WriteHeader(http.StatusOK)
 			case r.Method == http.MethodPost && r.URL.Path == "/quitquitquit":
-				forceCalled = true
+				forceCalled.Store(true)
 				w.WriteHeader(http.StatusOK)
 			default:
 				w.WriteHeader(http.StatusNotFound)
 			}
 		})
 
+		resetForce(t)
 		*force = true
 		complete = make(chan bool, 1)
 		rec := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/shutdown", nil)
+		r := httptest.NewRequest(http.MethodGet, "/shutdown?delay=0&period=0&deadline=300", nil)
 		shutdown(rec, r)
 
 		if rec.Code != http.StatusOK {
 			t.Errorf("shutdown() status = %d, want %d", rec.Code, http.StatusOK)
 		}
-		if !drainCalled {
+		if !drainCalled.Load() {
 			t.Error("shutdown() did not call drain_listeners, want drain to start")
 		}
-		if !forceCalled {
+		if !forceCalled.Load() {
 			t.Error("shutdown() did not call force shutdown, want force after connections closed")
 		}
 		if got := <-complete; !got {
@@ -535,7 +558,7 @@ func TestShutdownHandler(t *testing.T) {
 			t.Errorf("shutdown() status = %d, want %d", rec.Code, http.StatusRequestTimeout)
 		}
 		if got := <-complete; !got {
-			t.Error("shutdown() completed signal = true, want true (timeout still signals completion)")
+			t.Errorf("shutdown() completed signal = %v, want true (timeout still signals completion)", got)
 		}
 	})
 }
